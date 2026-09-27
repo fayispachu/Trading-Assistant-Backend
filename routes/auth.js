@@ -42,8 +42,9 @@ authRouter.post('/register', async (req, res) => {
       passwordHash,
     });
 
-    setAuthCookie(res, String(user._id));
+    const token = setAuthCookie(res, String(user._id));
     return res.status(201).json({
+      token,
       user: { id: user._id, name: user.name, email: user.email },
     });
   } catch (error) {
@@ -72,8 +73,9 @@ authRouter.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Incorrect email or password.' });
     }
 
-    setAuthCookie(res, String(user._id));
+    const token = setAuthCookie(res, String(user._id));
     return res.json({
+      token,
       user: { id: user._id, name: user.name, email: user.email },
     });
   } catch (error) {
@@ -83,7 +85,11 @@ authRouter.post('/login', async (req, res) => {
 });
 
 authRouter.post('/logout', (req, res) => {
-  res.clearCookie('session');
+  const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+  res.clearCookie('session', {
+    sameSite: isProduction ? 'none' : 'lax',
+    secure: isProduction,
+  });
   return res.sendStatus(204);
 });
 

@@ -5,7 +5,6 @@ import { calculateStructureBias, calculateTimeframeDirection } from '../services
 
 export function createMarketRouter(provider) {
   const router = Router();
-  router.use(authMiddleware);
 
   router.get('/overview', async (req, res) => {
     try {

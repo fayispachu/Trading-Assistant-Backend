@@ -70,7 +70,15 @@ const isAllowedOrigin = (origin) => {
     return true;
   }
 
-  return allowedOrigins.includes(origin);
+  if (allowedOrigins.includes(origin)) {
+    return true;
+  }
+
+  if (origin.endsWith('.netlify.app') || origin.endsWith('.vercel.app')) {
+    return true;
+  }
+
+  return false;
 };
 
 const corsOptions = {

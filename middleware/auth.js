@@ -4,10 +4,11 @@ const secret = process.env.AUTH_SECRET || 'development-only-change-me';
 
 export const setAuthCookie = (res, id) => {
   const token = jwt.sign({ id }, secret, { expiresIn: '7d' });
+  const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
   res.cookie('session', token, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    sameSite: isProduction ? 'none' : 'lax',
+    secure: isProduction,
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
   return token;
