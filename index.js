@@ -28,7 +28,7 @@ const app = express();
 const server = http.createServer(app);
 const secret = process.env.AUTH_SECRET || 'development-only-change-me';
 const port = Number(process.env.PORT || 3001);
-const clientOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
+const clientOrigin = process.env.CLIENT_ORIGIN || 'https://traderassistant.netlify.app';
 
 const isAllowedOrigin = (origin) =>
   !origin ||
