@@ -1,7 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { Setup, AgentEvent } from '../models/index.js';
-import { normalizeSymbol } from './market.js';
-import { analyzeChochSetup, calculateStructureBias, calculateTimeframeDirection } from './structure.js';
+import { User } from '../models/User.js';
+import { normalizeSymbol, isNasdaqSymbol } from './market.js';
+import { analyzeChochSetup, calculateTimeframeDirection } from './structure.js';
+import { evaluateNqBulletStrategy } from './nqBullet.js';
+import { sendSetupConfirmationEmail } from './email.js';
 
 export function evaluateConditionMatch(condition, event) {
   const params = condition.parameters || {};
@@ -26,13 +29,113 @@ export function evaluateConditionMatch(condition, event) {
     case 'ENTRY_CONFIRMATION':
       return event.type === 'ENTRY_CONFIRMED';
     case 'CHOCH_2C_CONFIRMATION':
-      return event.type === 'STRATEGY_CONFIRMED';
+    case 'NQ_BULLET_CONFIRMATION':
+      return event.type === 'STRATEGY_CONFIRMED' || event.type === 'NQ_BULLET_CONFIRMED';
     default:
       if (condition.type.startsWith('CUSTOM_CONFIRMATION_') && event.type === condition.type) {
         return true;
       }
       return false;
   }
+}
+
+async function triggerConfirmationEmail(setup, eventRecord, targets) {
+  try {
+    const userRecord = await User.findById(setup.userId);
+    if (!userRecord || userRecord.emailNotifications === false) return;
+
+    sendSetupConfirmationEmail({
+      to: userRecord.alertEmail || userRecord.email,
+      setup: typeof setup.toObject === 'function' ? setup.toObject() : setup,
+      event: typeof eventRecord?.toObject === 'function' ? eventRecord.toObject() : eventRecord,
+      targets: targets || setup.strategyProgress?.targets,
+      userConfig: userRecord.emailConfig || {},
+    }).catch((emailErr) => {
+      console.warn('Confirmation email dispatch warning:', emailErr.message);
+    });
+  } catch (err) {
+    console.warn('triggerConfirmationEmail error:', err.message);
+  }
+}
+
+export function buildJournalTradePlan(setup, currentPrice) {
+  const progress = setup.strategyProgress || {};
+  const direction = progress.direction || setup.direction;
+  const stopLoss = Number(progress.targets?.stopLoss);
+  const entryCandidates = [
+    currentPrice,
+    progress.candle2?.close,
+    progress.chochPrice,
+    progress.swingLevel,
+  ];
+  const entryPrice = entryCandidates
+    .map(Number)
+    .find((price) => Number.isFinite(price) && price > 0);
+  const validLevels =
+    Number.isFinite(stopLoss) &&
+    Number.isFinite(entryPrice) &&
+    ((direction === 'BUY' && stopLoss < entryPrice) ||
+      (direction === 'SELL' && stopLoss > entryPrice));
+  const risk = validLevels ? Math.abs(entryPrice - stopLoss) : null;
+
+  return {
+    setupName: setup.name,
+    timeframe: setup.primaryTimeframe || '15M',
+    tradeEntryPrice: validLevels ? entryPrice : undefined,
+    tradeStopLoss: Number.isFinite(stopLoss) ? stopLoss : undefined,
+    tradeTakeProfit: validLevels
+      ? entryPrice + (direction === 'BUY' ? 1 : -1) * risk * 3
+      : undefined,
+    tradeRiskReward: '1:3',
+    journalOutcome: 'OPEN',
+    journalLastPrice: validLevels ? entryPrice : undefined,
+  };
+}
+
+export function evaluateJournalTrade(entry, marketData) {
+  const entryPrice = Number(entry.tradeEntryPrice);
+  const stopLoss = Number(entry.tradeStopLoss);
+  const takeProfit = Number(entry.tradeTakeProfit);
+  const price = Number(marketData.price);
+  if (
+    !Number.isFinite(entryPrice) ||
+    !Number.isFinite(stopLoss) ||
+    !Number.isFinite(takeProfit) ||
+    !Number.isFinite(price)
+  ) {
+    return null;
+  }
+
+  const low = marketData.low != null && Number.isFinite(Number(marketData.low))
+    ? Number(marketData.low)
+    : price;
+  const high = marketData.high != null && Number.isFinite(Number(marketData.high))
+    ? Number(marketData.high)
+    : price;
+  if (!['BUY', 'SELL'].includes(entry.direction)) return null;
+  const isBuy = entry.direction === 'BUY';
+  const hasCandleRange = marketData.low != null || marketData.high != null;
+  const previousPrice = Number(entry.journalLastPrice);
+  const hasPreviousPrice = Number.isFinite(previousPrice);
+  const stopHit = hasCandleRange
+    ? isBuy ? low <= stopLoss : high >= stopLoss
+    : isBuy
+      ? hasPreviousPrice ? previousPrice > stopLoss && price <= stopLoss : price <= stopLoss
+      : hasPreviousPrice ? previousPrice < stopLoss && price >= stopLoss : price >= stopLoss;
+  const targetHit = hasCandleRange
+    ? isBuy ? high >= takeProfit : low <= takeProfit
+    : isBuy
+      ? hasPreviousPrice ? previousPrice < takeProfit && price >= takeProfit : price >= takeProfit
+      : hasPreviousPrice ? previousPrice > takeProfit && price <= takeProfit : price <= takeProfit;
+  if (!stopHit && !targetHit) return null;
+
+  const outcome = stopHit ? 'LOSS' : 'WIN';
+  return {
+    outcome,
+    resultR: outcome === 'WIN' ? 3 : -1,
+    exitPrice: outcome === 'WIN' ? takeProfit : stopLoss,
+    closedAt: marketData.time ? new Date(marketData.time) : new Date(),
+  };
 }
 
 export class StrategyEngine {
@@ -42,6 +145,9 @@ export class StrategyEngine {
     this.marketState = new Map();
     this.candleState = new Map();
     this.candleHistory = new Map();
+    this.journalSubscriptions = new Set();
+    this.journalBackfillSymbols = new Set();
+    this.journalBackfillComplete = false;
 
     if (provider && typeof provider.onTick === 'function') {
       provider.onTick((tick) => {
@@ -65,9 +171,15 @@ export class StrategyEngine {
         const frameHistory = this.candleHistory.get(symbol) || new Map();
         const candles = frameHistory.get('15M') || [];
         if (candles.length > 0) {
-          this.processChochSetups(symbol, candles, frameHistory).catch((err) => {
-            console.warn('StrategyEngine onRefresh error:', err.message);
-          });
+          if (isNasdaqSymbol(symbol)) {
+            this.processNqBulletSetups(symbol, candles, frameHistory).catch((err) => {
+              console.warn('StrategyEngine processNqBulletSetups onRefresh error:', err.message);
+            });
+          } else {
+            this.processChochSetups(symbol, candles, frameHistory).catch((err) => {
+              console.warn('StrategyEngine processChochSetups onRefresh error:', err.message);
+            });
+          }
         }
       });
     }
@@ -83,6 +195,278 @@ export class StrategyEngine {
 
   onUpdate(cb) {
     this.bus.on('update', cb);
+  }
+
+  async settleJournalTrades(symbol, marketData) {
+    if (!this.provider || !this.journalBackfillComplete || this.journalBackfillSymbols.has(symbol)) return;
+
+    try {
+      const entries = await AgentEvent.find({
+        symbol: normalizeSymbol(symbol),
+        type: 'STRATEGY_CONFIRMED',
+        journalOutcome: 'OPEN',
+        tradeEntryPrice: { $type: 'number' },
+        tradeStopLoss: { $type: 'number' },
+        tradeTakeProfit: { $type: 'number' },
+      }).lean();
+
+      for (const entry of entries) {
+        const eventTime = new Date(entry.createdAt).getTime();
+        const observationStart = marketData.openTime ?? marketData.time;
+        if (observationStart != null && eventTime >= Number(observationStart)) {
+          continue;
+        }
+
+        const result = evaluateJournalTrade(entry, marketData);
+        if (!result) {
+          const price = Number(marketData.price);
+          if (Number.isFinite(price)) {
+            await AgentEvent.updateOne(
+              { _id: entry._id, journalOutcome: 'OPEN' },
+              { $set: { journalLastPrice: price } }
+            );
+          }
+          continue;
+        }
+
+        const updated = await AgentEvent.findOneAndUpdate(
+          { _id: entry._id, journalOutcome: 'OPEN' },
+          {
+            $set: {
+              journalOutcome: result.outcome,
+              journalResultR: result.resultR,
+              tradeExitPrice: result.exitPrice,
+              journalClosedAt: result.closedAt,
+              journalResultSource: 'AUTO',
+            },
+          },
+          { new: true }
+        );
+
+        if (updated) {
+          this.publishJournalUpdate(updated);
+        }
+      }
+    } catch (error) {
+      console.warn('Journal outcome settlement error:', error.message);
+    }
+  }
+
+  async backfillJournalTrades(userId, legacyEntries = []) {
+    const userFilter = userId ? { userId } : {};
+    const entriesByEventId = new Map();
+    const entriesBySetupId = new Map();
+    for (const entry of legacyEntries) {
+      const eventIdMatch = String(entry.id || '').match(/^[a-f\d]{24}-([a-f\d]{24})$/i);
+      if (eventIdMatch) entriesByEventId.set(eventIdMatch[1], entry);
+      if (entry.setupId) {
+        const setupEntries = entriesBySetupId.get(String(entry.setupId)) || [];
+        setupEntries.push(entry);
+        entriesBySetupId.set(String(entry.setupId), setupEntries);
+      }
+    }
+
+    const oldEvents = await AgentEvent.find({
+      ...userFilter,
+      type: 'STRATEGY_CONFIRMED',
+      journalResultSource: { $ne: 'AUTO' },
+    }).sort({ createdAt: 1 });
+
+    for (const event of oldEvents) {
+      if (isNasdaqSymbol(event.symbol)) continue;
+      const needsResultReset =
+        event.journalOutcome !== 'OPEN' ||
+        event.journalResultSource ||
+        event.journalResultR != null ||
+        event.tradeExitPrice != null ||
+        event.journalClosedAt != null;
+      if (needsResultReset) {
+        event.journalOutcome = 'OPEN';
+        event.journalResultSource = undefined;
+        event.journalResultR = undefined;
+        event.tradeExitPrice = undefined;
+        event.journalClosedAt = undefined;
+        await event.save();
+      }
+
+      const hasCompletePlan =
+        ['BUY', 'SELL'].includes(event.direction) &&
+        Number.isFinite(event.tradeEntryPrice) &&
+        Number.isFinite(event.tradeStopLoss) &&
+        Number.isFinite(event.tradeTakeProfit);
+      if (hasCompletePlan) continue;
+
+      const legacyEntry =
+        entriesByEventId.get(String(event._id)) ||
+        entriesBySetupId.get(String(event.setupId))?.find((entry) => {
+          const date = new Date(entry.confirmedAt).getTime();
+          return Number.isFinite(date) &&
+            Math.abs(date - new Date(event.createdAt).getTime()) < 60000;
+        });
+      const setupQuery = { _id: event.setupId, ...userFilter };
+      const setup = await Setup.findOne(setupQuery).lean();
+      const progress = setup?.strategyProgress || {};
+      const directionCandidates = [
+        event.direction,
+        legacyEntry?.direction,
+        progress.direction,
+        setup?.direction,
+      ];
+      const rawDirection = directionCandidates.find((direction) =>
+        ['BUY', 'SELL', 'BULLISH', 'BEARISH'].includes(String(direction || '').toUpperCase())
+      );
+      const direction = ['BUY', 'BULLISH'].includes(String(rawDirection || '').toUpperCase())
+        ? 'BUY'
+        : ['SELL', 'BEARISH'].includes(String(rawDirection || '').toUpperCase())
+          ? 'SELL'
+          : null;
+      const entryCandidates = [
+        event.tradeEntryPrice,
+        legacyEntry?.entryPrice,
+        progress.candle2?.close,
+        progress.targets?.entryPrice,
+        progress.chochPrice,
+        event.price,
+        progress.swingLevel,
+      ];
+      const entryPrice = entryCandidates
+        .map(Number)
+        .find((price) => Number.isFinite(price) && price > 0);
+      const stopLoss = [
+        event.tradeStopLoss,
+        legacyEntry?.stopLoss,
+        progress.targets?.stopLoss,
+      ].map(Number).find((price) => Number.isFinite(price) && price > 0);
+      const validLevels =
+        direction &&
+        Number.isFinite(entryPrice) &&
+        Number.isFinite(stopLoss) &&
+        ((direction === 'BUY' && stopLoss < entryPrice) ||
+          (direction === 'SELL' && stopLoss > entryPrice));
+      if (!validLevels) continue;
+
+      const risk = Math.abs(entryPrice - stopLoss);
+      event.setupName = event.setupName || legacyEntry?.name || setup?.name || `${event.symbol} setup`;
+      event.timeframe = event.timeframe || legacyEntry?.timeframe || setup?.primaryTimeframe || '15M';
+      event.direction = direction;
+      event.tradeEntryPrice = event.tradeEntryPrice ?? entryPrice;
+      event.tradeStopLoss = event.tradeStopLoss ?? stopLoss;
+      event.tradeTakeProfit =
+        event.tradeTakeProfit ??
+        entryPrice + (direction === 'BUY' ? 1 : -1) * risk * 3;
+      event.tradeRiskReward = event.tradeRiskReward || '1:3';
+      event.journalOutcome = 'OPEN';
+      event.journalResultR = undefined;
+      event.tradeExitPrice = undefined;
+      event.journalClosedAt = undefined;
+      event.journalResultSource = undefined;
+      event.journalLastPrice = event.journalLastPrice ?? entryPrice;
+      await event.save();
+    }
+
+    const openEvents = await AgentEvent.find({
+      ...userFilter,
+      type: 'STRATEGY_CONFIRMED',
+      journalOutcome: 'OPEN',
+      tradeEntryPrice: { $type: 'number' },
+      tradeStopLoss: { $type: 'number' },
+      tradeTakeProfit: { $type: 'number' },
+    }).lean();
+
+    const journalSymbols = new Set(
+      openEvents
+        .filter((event) => !isNasdaqSymbol(event.symbol))
+        .map((event) => normalizeSymbol(event.symbol))
+    );
+    for (const symbol of journalSymbols) {
+      this.journalBackfillSymbols.add(symbol);
+      if (this.provider && !this.journalSubscriptions.has(symbol)) {
+        try {
+          await this.provider.subscribe(symbol, '15M');
+          this.journalSubscriptions.add(symbol);
+        } catch (error) {
+          console.warn(`Journal feed subscription skipped for ${symbol}:`, error.message);
+        }
+      }
+      const snapshot = this.provider?.getSnapshot?.(symbol);
+      if (snapshot) this.seedFromSnapshot(symbol, snapshot);
+    }
+
+    for (const event of openEvents) {
+      const symbol = normalizeSymbol(event.symbol);
+      if (isNasdaqSymbol(symbol)) continue;
+      const candles = this.candleHistory.get(symbol)?.get('15M') || [];
+      const confirmedAt = new Date(event.createdAt).getTime();
+      const lastEvaluatedAt = Number(event.journalLastEvaluatedAt) || 0;
+      const historyComplete = candles.length > 0 && Number(candles[0].openTime) <= confirmedAt;
+      let latestEvaluatedAt = lastEvaluatedAt;
+      let settled = false;
+      if (historyComplete) {
+        for (const candle of candles) {
+          if (
+            Number(candle.openTime) < confirmedAt ||
+            Number(candle.closeTime) <= lastEvaluatedAt
+          ) {
+            continue;
+          }
+          latestEvaluatedAt = Math.max(latestEvaluatedAt, Number(candle.closeTime) || 0);
+          const result = evaluateJournalTrade(event, {
+            price: candle.close,
+            low: candle.low,
+            high: candle.high,
+            time: candle.closeTime,
+          });
+          if (!result) continue;
+
+          const updated = await AgentEvent.findOneAndUpdate(
+            { _id: event._id, journalOutcome: 'OPEN' },
+            {
+              $set: {
+                journalOutcome: result.outcome,
+                journalResultR: result.resultR,
+                tradeExitPrice: result.exitPrice,
+                journalClosedAt: result.closedAt,
+                journalResultSource: 'AUTO',
+                journalLastEvaluatedAt: latestEvaluatedAt,
+              },
+            },
+            { new: true }
+          );
+          if (updated) this.publishJournalUpdate(updated);
+          settled = Boolean(updated);
+          break;
+        }
+      }
+
+      if (settled) continue;
+      const latestCandle = candles.at(-1);
+      if (latestCandle) {
+        latestEvaluatedAt = Math.max(latestEvaluatedAt, Number(latestCandle.closeTime) || 0);
+      }
+      const currentPrice = Number(this.provider?.getSnapshot?.(symbol)?.price);
+      await AgentEvent.updateOne(
+        { _id: event._id, journalOutcome: 'OPEN' },
+        {
+          $set: {
+            journalLastPrice: Number.isFinite(currentPrice)
+              ? currentPrice
+              : event.journalLastPrice ?? event.tradeEntryPrice,
+            journalLastEvaluatedAt: latestEvaluatedAt,
+          },
+        }
+      );
+    }
+
+    for (const symbol of journalSymbols) this.journalBackfillSymbols.delete(symbol);
+    this.journalBackfillComplete = true;
+  }
+
+  publishJournalUpdate(entry) {
+    this.bus.emit('update', {
+      type: 'journal:update',
+      userId: String(entry.userId),
+      journalEntry: entry.toObject(),
+    });
   }
 
   async start(setup) {
@@ -103,17 +487,71 @@ export class StrategyEngine {
         condition.message = '';
       });
 
+      const isNasdaq = isNasdaqSymbol(record.symbol);
+      const frameHistory = this.candleHistory.get(record.symbol) || new Map();
+      const candles15m = frameHistory.get('15M') || [];
+      const candles1h = frameHistory.get('1H') || [];
+
+      // 1. Check if setup is NQ Bullet
+      const nqCondition = record.conditions.find(
+        (c) => c.type === 'NQ_BULLET_CONFIRMATION'
+      );
+      if (nqCondition || isNasdaq) {
+        const nqProgress = evaluateNqBulletStrategy(candles15m, candles1h, nqCondition?.parameters || {});
+        record.strategyProgress = nqProgress;
+
+        if (nqProgress.confirmed) {
+          if (nqCondition) {
+            nqCondition.status = 'TRIGGERED';
+            nqCondition.triggeredAt = new Date();
+            nqCondition.triggeredPrice = nqProgress.currentPrice;
+            nqCondition.message = `NQ Bullet BUY/SELL Confirmed! Entry: ${nqProgress.targets.entryPrice} | SL: ${nqProgress.targets.stopLoss} | TP: ${nqProgress.targets.takeProfit}`;
+          }
+          record.status = 'CONFIRMED';
+        } else if (nqProgress.breakoutSeen || nqProgress.boxReady) {
+          record.status = 'PARTIALLY_CONFIRMED';
+        }
+
+        await record.save();
+
+        let eventRecord = null;
+        if (record.status === 'CONFIRMED') {
+          const currentPrice = this.provider.getSnapshot(record.symbol)?.price;
+          eventRecord = new AgentEvent({
+            userId: record.userId,
+            setupId: record._id,
+            eventId: `NQ_BULLET_CONFIRMED-${Date.now()}-${record._id}`,
+            type: 'STRATEGY_CONFIRMED',
+            symbol: record.symbol,
+            message: nqCondition?.message || 'NQ Bullet strategy fully confirmed!',
+            price: nqProgress.currentPrice,
+            direction: nqProgress.direction,
+          });
+          await eventRecord.save();
+          triggerConfirmationEmail(record, eventRecord, nqProgress.targets);
+        }
+
+        this.bus.emit('update', {
+          type: 'setup-start',
+          setupId: record._id.toString(),
+          userId: record.userId.toString(),
+          setup: record.toObject(),
+          event: eventRecord?.toObject(),
+        });
+        return;
+      }
+
+      // 2. Standard 15M CHOCH sequence for XRP
       const strategyCondition = record.conditions.find(
         (condition) => condition.type === 'CHOCH_2C_CONFIRMATION'
       );
       if (strategyCondition) {
-        const frameHistory = this.candleHistory.get(record.symbol) || new Map();
         record.strategyProgress = analyzeChochSetup(
-          frameHistory.get('15M'),
+          candles15m,
           record.direction,
           { ...strategyCondition.parameters }
         );
-        const oneHourDir = calculateTimeframeDirection(frameHistory.get('1H'));
+        const oneHourDir = calculateTimeframeDirection(candles1h);
         const fourHourDir = calculateTimeframeDirection(frameHistory.get('4H'));
         record.strategyProgress.timeframeBias = {
           '1H': oneHourDir,
@@ -135,6 +573,7 @@ export class StrategyEngine {
 
       let eventRecord = null;
       if (record.status === 'CONFIRMED' && strategyCondition) {
+        const currentPrice = this.provider.getSnapshot(record.symbol)?.price;
         eventRecord = new AgentEvent({
           userId: record.userId,
           setupId: record._id,
@@ -144,8 +583,10 @@ export class StrategyEngine {
           message: strategyCondition.message,
           price: record.strategyProgress.chochPrice,
           direction: record.strategyProgress.direction,
+          ...buildJournalTradePlan(record, currentPrice),
         });
         await eventRecord.save();
+        triggerConfirmationEmail(record, eventRecord, record.strategyProgress?.targets);
       }
 
       this.bus.emit('update', {
@@ -179,6 +620,11 @@ export class StrategyEngine {
     if (!tick || !tick.symbol) return;
 
     try {
+      await this.settleJournalTrades(tick.symbol, {
+        price: tick.price,
+        time: tick.time,
+      });
+
       const snapshot = this.provider?.getSnapshot?.(tick.symbol);
       const previousClosedCandle = snapshot?.candles?.filter((candle) => candle.isClosed).at(-1);
       const state = this.marketState.get(tick.symbol) || {
@@ -261,6 +707,16 @@ export class StrategyEngine {
 
     try {
       const timeframe = candle.timeframe || '15M';
+      if (timeframe === '15M') {
+        await this.settleJournalTrades(candle.symbol, {
+          price: candle.close,
+          low: candle.low,
+          high: candle.high,
+          time: candle.closeTime,
+          openTime: candle.openTime,
+        });
+      }
+
       const frameHistory = this.candleHistory.get(candle.symbol) || new Map();
       const candles = frameHistory.get(timeframe) || [];
       if (candles.at(-1)?.closeTime >= candle.closeTime) return;
@@ -271,7 +727,11 @@ export class StrategyEngine {
       this.candleHistory.set(candle.symbol, frameHistory);
 
       if (timeframe === '15M') {
-        await this.processChochSetups(candle.symbol, candles, frameHistory);
+        if (isNasdaqSymbol(candle.symbol)) {
+          await this.processNqBulletSetups(candle.symbol, candles, frameHistory);
+        } else {
+          await this.processChochSetups(candle.symbol, candles, frameHistory);
+        }
       }
 
       const candleStateKey = `${candle.symbol}:${timeframe}`;
@@ -329,6 +789,61 @@ export class StrategyEngine {
     }
   }
 
+  async processNqBulletSetups(symbol, candles, frameHistory) {
+    const setups = await Setup.find({
+      symbol,
+      status: { $in: ['MONITORING', 'PARTIALLY_CONFIRMED'] },
+    });
+    const candles1h = frameHistory.get('1H') || [];
+
+    for (const setup of setups) {
+      const condition = setup.conditions.find((c) => c.type === 'NQ_BULLET_CONFIRMATION') || setup.conditions[0];
+      const progress = evaluateNqBulletStrategy(candles, candles1h, condition?.parameters || {});
+      setup.strategyProgress = progress;
+
+      if (progress.confirmed && setup.status !== 'CONFIRMED') {
+        if (condition) {
+          condition.status = 'TRIGGERED';
+          condition.triggeredAt = new Date();
+          condition.triggeredPrice = progress.currentPrice;
+          condition.message = `NQ Bullet ${progress.direction} Confirmed! Entry: ${progress.targets.entryPrice} | SL: ${progress.targets.stopLoss} | TP: ${progress.targets.takeProfit}`;
+        }
+        setup.status = 'CONFIRMED';
+        await setup.save();
+
+        const eventRecord = new AgentEvent({
+          userId: setup.userId,
+          setupId: setup._id,
+          eventId: `NQ_BULLET_CONFIRMED-${Date.now()}-${setup._id}`,
+          type: 'STRATEGY_CONFIRMED',
+          symbol: setup.symbol,
+          message: condition?.message || 'NQ Bullet strategy fully confirmed!',
+          price: progress.currentPrice,
+          direction: progress.direction,
+        });
+        await eventRecord.save();
+        triggerConfirmationEmail(setup, eventRecord, progress.targets);
+
+        this.bus.emit('update', {
+          type: 'setup:update',
+          setupId: setup._id.toString(),
+          userId: setup.userId.toString(),
+          setup: setup.toObject(),
+          event: eventRecord.toObject(),
+        });
+        continue;
+      }
+
+      await setup.save();
+      this.bus.emit('update', {
+        type: 'setup:progress',
+        setupId: setup._id.toString(),
+        userId: setup.userId.toString(),
+        setup: setup.toObject(),
+      });
+    }
+  }
+
   async processChochSetups(symbol, candles, frameHistory) {
     const setups = await Setup.find({
       symbol,
@@ -366,8 +881,14 @@ export class StrategyEngine {
           message: condition.message,
           price: progress.chochPrice,
           direction: progress.direction,
+          ...buildJournalTradePlan(
+            setup,
+            this.provider.getSnapshot(setup.symbol)?.price
+          ),
         });
         await eventRecord.save();
+        triggerConfirmationEmail(setup, eventRecord, progress.targets);
+
         this.bus.emit('update', {
           type: 'setup:update',
           setupId: setup._id.toString(),
@@ -405,6 +926,115 @@ export class StrategyEngine {
     const setup = await Setup.findById(setupId);
     if (!setup) throw new Error('Setup not found');
 
+    const isNasdaq = isNasdaqSymbol(setup.symbol);
+    const nqCondition = setup.conditions.find((c) => c.type === 'NQ_BULLET_CONFIRMATION');
+
+    // 1. Simulation for NQ Bullet Setup
+    if (nqCondition || isNasdaq) {
+      const snapshot = await this.provider.getSnapshot(setup.symbol);
+      const currentPrice = Number(snapshot?.price || 20485.50);
+      const dir = setup.direction === 'BOTH' || setup.direction === 'BUY' ? 'BUY' : 'SELL';
+      const isBuy = dir === 'BUY';
+
+      let progress = setup.strategyProgress || { stage: 0 };
+      const stage = (progress.stage || 0) + 1;
+
+      const boxHigh = Number((currentPrice + 45).toFixed(2));
+      const boxLow = Number((currentPrice - 35).toFixed(2));
+      const stopLoss = isBuy ? boxLow : boxHigh;
+      const risk = Math.abs(currentPrice - stopLoss);
+      const takeProfit = isBuy ? Number((currentPrice + risk * 2.0).toFixed(2)) : Number((currentPrice - risk * 2.0).toFixed(2));
+
+      if (stage === 1) {
+        progress = {
+          stage: 1,
+          strategy: 'NQ_BULLET',
+          boxReady: true,
+          boxHigh,
+          boxLow,
+          boxRange: Number((boxHigh - boxLow).toFixed(2)),
+          currentPrice,
+          inTradeSession: true,
+          trend: isBuy ? 'UPTREND' : 'DOWNTREND',
+          ema50: Number((currentPrice - (isBuy ? 15 : -15)).toFixed(2)),
+          breakoutSeen: false,
+          retestConfirmed: false,
+          confirmed: false,
+          direction: dir,
+          targets: { entryPrice: currentPrice, stopLoss, takeProfit, riskReward: '1:2.0', riskPoints: risk },
+          sequenceSteps: [
+            { id: 1, name: 'Daily Box Formation (10:30 - 10:45 IST)', status: 'TRIGGERED', desc: `Box Formed! High: ${boxHigh} | Low: ${boxLow} (${(boxHigh - boxLow).toFixed(2)} pts)` },
+            { id: 2, name: 'Trading Session (10:45 - 15:15 IST)', status: 'TRIGGERED', desc: 'Trading Session Active (IST)' },
+            { id: 3, name: '50 EMA Trend Filter', status: 'PENDING', desc: 'Awaiting trend confirmation' },
+            { id: 4, name: 'Box Breakout & Zone Retest', status: 'PENDING', desc: 'Awaiting breakout beyond box' },
+            { id: 5, name: '1H Major Levels & Execution', status: 'PENDING', desc: 'Awaiting execution confirmation' },
+          ],
+        };
+        setup.strategyProgress = progress;
+        setup.status = 'PARTIALLY_CONFIRMED';
+        await setup.save();
+        this.bus.emit('update', { type: 'setup:progress', setupId: setup._id.toString(), userId: setup.userId.toString(), setup: setup.toObject() });
+        return { setup, message: `Step 1 Triggered: Daily Box established (${boxHigh} - ${boxLow}) for ${setup.symbol}` };
+      } else if (stage === 2) {
+        progress.stage = 2;
+        progress.breakoutSeen = true;
+        progress.breakoutDir = isBuy ? 1 : -1;
+        progress.sequenceSteps[2].status = 'TRIGGERED';
+        progress.sequenceSteps[2].desc = `50 EMA (${progress.ema50}) Aligned with ${dir} Trend`;
+        progress.sequenceSteps[3].status = 'PARTIAL';
+        progress.sequenceSteps[3].desc = `Breakout seen (${isBuy ? 'above ' + boxHigh : 'below ' + boxLow}). Awaiting retest touch.`;
+        setup.strategyProgress = progress;
+        setup.status = 'PARTIALLY_CONFIRMED';
+        await setup.save();
+        this.bus.emit('update', { type: 'setup:progress', setupId: setup._id.toString(), userId: setup.userId.toString(), setup: setup.toObject() });
+        return { setup, message: `Step 2 Triggered: ${dir} Breakout beyond Box & 50 EMA confirmed!` };
+      } else {
+        // Full confirmation
+        progress.stage = 3;
+        progress.retestConfirmed = true;
+        progress.confirmed = true;
+        progress.sequenceSteps[3].status = 'TRIGGERED';
+        progress.sequenceSteps[3].desc = `Zone Retest Confirmed! ${isBuy ? 'Tested Box High (' + boxHigh + ')' : 'Tested Box Low (' + boxLow + ')'} and held.`;
+        progress.sequenceSteps[4].status = 'TRIGGERED';
+        progress.sequenceSteps[4].desc = `100% Confirmed! Entry: ${currentPrice} | SL: ${stopLoss} | TP: ${takeProfit} (1:2 R:R)`;
+
+        if (nqCondition) {
+          nqCondition.status = 'TRIGGERED';
+          nqCondition.triggeredAt = new Date();
+          nqCondition.triggeredPrice = currentPrice;
+          nqCondition.message = `[Simulated] NQ Bullet ${dir} Confirmed! Entry: ${currentPrice} | SL: ${stopLoss} | TP: ${takeProfit}`;
+        }
+        setup.strategyProgress = progress;
+        setup.status = 'CONFIRMED';
+        await setup.save();
+
+        const eventRecord = new AgentEvent({
+          userId: setup.userId,
+          setupId: setup._id,
+          eventId: `STRATEGY_CONFIRMED-${Date.now()}-${setup._id}`,
+          type: 'STRATEGY_CONFIRMED',
+          symbol: setup.symbol,
+          message: `[Simulated] NQ Bullet ${dir} Setup FULLY CONFIRMED! Entry: ${currentPrice} | SL: ${stopLoss} | TP: ${takeProfit}`,
+          price: currentPrice,
+          direction: dir,
+        });
+        await eventRecord.save();
+
+        // Send email alert!
+        triggerConfirmationEmail(setup, eventRecord, progress.targets);
+
+        this.bus.emit('update', {
+          type: 'setup:update',
+          setupId: setup._id.toString(),
+          userId: setup.userId.toString(),
+          setup: setup.toObject(),
+          event: eventRecord.toObject(),
+        });
+        return { setup, message: `Step 3 Triggered: NQ Bullet Retest Confirmed! All confirmations met & Email sent!` };
+      }
+    }
+
+    // 2. Simulation for XRP 15M CHOCH Setup
     const strategyCondition = setup.conditions.find((c) => c.type === 'CHOCH_2C_CONFIRMATION');
     if (strategyCondition && strategyCondition.status !== 'TRIGGERED') {
       const snapshot = await this.provider.getSnapshot(setup.symbol);
@@ -433,9 +1063,9 @@ export class StrategyEngine {
             swingType: isSell ? 'HH_TO_HL' : 'LL_TO_LH',
           },
           targets: {
+            entryPrice: currentPrice,
             stopLoss: isSell ? swingAnchor : swingLevel,
-            target1R: isSell ? swingLevel - Math.abs(swingAnchor - swingLevel) : swingLevel + Math.abs(swingAnchor - swingLevel),
-            target2R: isSell ? swingLevel - 2 * Math.abs(swingAnchor - swingLevel) : swingLevel + 2 * Math.abs(swingAnchor - swingLevel),
+            takeProfit: isSell ? swingLevel - 2 * Math.abs(swingAnchor - swingLevel) : swingLevel + 2 * Math.abs(swingAnchor - swingLevel),
             riskRewardRatio: '1:2',
           },
           candlesSinceChoch: 0,
@@ -480,7 +1110,6 @@ export class StrategyEngine {
         this.bus.emit('update', { type: 'setup:progress', setupId: setup._id.toString(), userId: setup.userId.toString(), setup: setup.toObject() });
         return { setup, message: `Step 2 & 3 Triggered: 15M CHOCH Body Close at $${chochPrice} & Confirmation Candle #1 closed!` };
       } else {
-        // Confirmation candle 2 & entry ready
         const confirmPrice = currentPrice;
         progress.phase = 'CONFIRMED';
         progress.confirmed = true;
@@ -513,8 +1142,15 @@ export class StrategyEngine {
           message: strategyCondition.message,
           price: confirmPrice,
           direction: dir,
+          ...buildJournalTradePlan(
+            setup,
+            this.provider.getSnapshot(setup.symbol)?.price
+          ),
         });
         await eventRecord.save();
+
+        // Send email alert!
+        triggerConfirmationEmail(setup, eventRecord, progress.targets);
 
         this.bus.emit('update', {
           type: 'setup:update',
@@ -523,46 +1159,15 @@ export class StrategyEngine {
           setup: setup.toObject(),
           event: eventRecord.toObject(),
         });
-        return { setup, message: `Step 4 & 5 Triggered: Candle #2 confirmed! Setup is FULLY CONFIRMED & Entry ready!` };
+        return { setup, message: `Step 4 & 5 Triggered: Candle #2 confirmed! Setup is FULLY CONFIRMED & Email sent!` };
       }
     }
 
+    // 3. Fallback standard condition
     const conditions = [...setup.conditions].sort((a, b) => Number(a.order) - Number(b.order));
     const nextPending = conditions.find((c) => c.status === 'PENDING');
     if (!nextPending) {
       return { setup, message: 'All conditions are already confirmed!' };
-    }
-
-    let eventType = 'HIGH_BROKEN';
-    let direction = setup.direction === 'SELL' ? 'BEARISH' : 'BULLISH';
-
-    switch (nextPending.type) {
-      case 'PREVIOUS_HIGH_BREAK':
-        eventType = 'HIGH_BROKEN';
-        break;
-      case 'PREVIOUS_LOW_BREAK':
-        eventType = 'LOW_BROKEN';
-        break;
-      case 'CHOCH':
-        eventType = 'CHOCH_DETECTED';
-        direction = nextPending.parameters?.direction || direction;
-        break;
-      case 'BOS':
-        eventType = 'BOS_DETECTED';
-        direction = nextPending.parameters?.direction || direction;
-        break;
-      case 'CANDLE_CONFIRMATION':
-        eventType = 'CANDLE_CONFIRMED';
-        break;
-      case 'RETEST':
-        eventType = 'RETEST_DETECTED';
-        break;
-      case 'CHOCH_2C_CONFIRMATION':
-        eventType = 'STRATEGY_CONFIRMED';
-        break;
-      default:
-        eventType = nextPending.type;
-        break;
     }
 
     const currentPrice = (await this.provider.getSnapshot(setup.symbol))?.price || 100;
@@ -570,11 +1175,11 @@ export class StrategyEngine {
 
     await this.fire({
       id: `sim:${setup.symbol}:${Date.now()}`,
-      type: eventType,
+      type: nextPending.type,
       symbol: setup.symbol,
       timeframe: nextPending.timeframe || setup.primaryTimeframe,
       price: simulatedPrice,
-      direction,
+      direction: setup.direction === 'SELL' ? 'BEARISH' : 'BULLISH',
       count: 2,
       message: `[Simulated] ${nextPending.name} triggered for ${setup.symbol} at $${simulatedPrice}`,
     });
@@ -638,6 +1243,10 @@ export class StrategyEngine {
           });
 
           await eventRecord.save();
+
+          if (setup.status === 'CONFIRMED') {
+            triggerConfirmationEmail(setup, eventRecord, setup.strategyProgress?.targets);
+          }
 
           this.bus.emit('update', {
             type: 'setup:update',

@@ -78,8 +78,9 @@ export function createSetupsRouter(engine, provider) {
           });
 
           await engine.start(defaultSetup);
-          const fresh = await Setup.findById(defaultSetup._id);
-          setups = fresh ? [fresh] : [defaultSetup];
+
+          const freshList = await Setup.find({ userId: req.user.id }).sort({ updatedAt: -1 });
+          setups = freshList.length > 0 ? freshList : [defaultSetup];
         } catch (seedErr) {
           console.warn('Auto-seed default setup note:', seedErr.message);
         }

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateConditionMatch, StrategyEngine } from '../engine.js';
+import {
+  buildJournalTradePlan,
+  evaluateConditionMatch,
+  evaluateJournalTrade,
+  StrategyEngine,
+} from '../engine.js';
 import { analyzeChochSetup, calculateTimeframeDirection, findSwingPivots } from '../services/structure.js';
 import { normalizeSymbol, timeframeToInterval } from '../services/market.js';
 
@@ -54,6 +59,93 @@ describe('condition mappings', () => {
         { type: 'STRATEGY_CONFIRMED' }
       )
     ).toBe(true);
+  });
+});
+
+describe('automated journal trade levels and outcomes', () => {
+  it('builds a 1:3 short target from the setup swing stop', () => {
+    const plan = buildJournalTradePlan(
+      {
+        name: 'XRP 15M CHOCH',
+        direction: 'BOTH',
+        primaryTimeframe: '15M',
+        strategyProgress: {
+          direction: 'SELL',
+          targets: { stopLoss: 110 },
+        },
+      },
+      100
+    );
+
+    expect(plan).toMatchObject({
+      tradeEntryPrice: 100,
+      tradeStopLoss: 110,
+      tradeTakeProfit: 70,
+      tradeRiskReward: '1:3',
+      journalOutcome: 'OPEN',
+    });
+  });
+
+  it('settles long and short trades at their target or swing stop', () => {
+    const long = { direction: 'BUY', tradeEntryPrice: 100, tradeStopLoss: 90, tradeTakeProfit: 130 };
+    const short = { direction: 'SELL', tradeEntryPrice: 100, tradeStopLoss: 110, tradeTakeProfit: 70 };
+
+    expect(evaluateJournalTrade(long, { price: 130 })).toMatchObject({
+      outcome: 'WIN',
+      resultR: 3,
+      exitPrice: 130,
+    });
+    expect(evaluateJournalTrade(long, { price: 90 })).toMatchObject({
+      outcome: 'LOSS',
+      resultR: -1,
+      exitPrice: 90,
+    });
+    expect(evaluateJournalTrade(short, { price: 70 })).toMatchObject({
+      outcome: 'WIN',
+      resultR: 3,
+      exitPrice: 70,
+    });
+    expect(evaluateJournalTrade(short, { price: 110 })).toMatchObject({
+      outcome: 'LOSS',
+      resultR: -1,
+      exitPrice: 110,
+    });
+  });
+
+  it('records a stop loss conservatively when one candle spans both levels', () => {
+    expect(
+      evaluateJournalTrade(
+        { direction: 'BUY', tradeEntryPrice: 100, tradeStopLoss: 90, tradeTakeProfit: 130 },
+        { price: 110, low: 89, high: 131 }
+      )
+    ).toMatchObject({ outcome: 'LOSS', resultR: -1, exitPrice: 90 });
+  });
+
+  it('only closes a live trade when price crosses a level after its last observation', () => {
+    const long = {
+      direction: 'BUY',
+      tradeEntryPrice: 100,
+      tradeStopLoss: 90,
+      tradeTakeProfit: 130,
+      journalLastPrice: 135,
+    };
+
+    expect(evaluateJournalTrade(long, { price: 136 })).toBeNull();
+    expect(
+      evaluateJournalTrade({ ...long, journalLastPrice: 129 }, { price: 130 })
+    ).toMatchObject({ outcome: 'WIN', resultR: 3, exitPrice: 130 });
+
+    const short = {
+      direction: 'SELL',
+      tradeEntryPrice: 100,
+      tradeStopLoss: 110,
+      tradeTakeProfit: 70,
+      journalLastPrice: 65,
+    };
+    expect(evaluateJournalTrade(short, { price: 64 })).toBeNull();
+    expect(
+      evaluateJournalTrade({ ...short, journalLastPrice: 71 }, { price: 70 })
+    ).toMatchObject({ outcome: 'WIN', resultR: 3, exitPrice: 70 });
   });
 });
 

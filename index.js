@@ -17,6 +17,8 @@ import { authRouter } from './routes/auth.js';
 import { createSetupsRouter } from './routes/setups.js';
 import { createMarketRouter } from './routes/market.js';
 import { eventsRouter } from './routes/events.js';
+import { emailRouter } from './routes/email.js';
+import { createJournalRouter } from './routes/journal.js';
 
 // ============================================================
 // GLOBAL RESILIENCE HANDLERS
@@ -171,6 +173,10 @@ app.use(
 // Events
 app.use('/api/events', eventsRouter);
 
+// Email alerts
+app.use('/api/email', emailRouter);
+app.use('/api/journal', createJournalRouter(engine));
+
 // ============================================================
 // HEALTH CHECK
 // ============================================================
@@ -294,6 +300,13 @@ provider.onTick((tick) => {
 
 engine.onUpdate((payload) => {
   if (payload.userId) {
+    if (payload.type === 'journal:update') {
+      io
+        .to(`user:${payload.userId}`)
+        .emit('journal:update', payload.journalEntry);
+      return;
+    }
+
     // Setup update
     io
       .to(
@@ -412,6 +425,12 @@ async function startServer() {
         'Initial setup pre-load skipped (DB connecting):',
         queryErr.message
       );
+    }
+
+    try {
+      await engine.backfillJournalTrades();
+    } catch (error) {
+      console.warn('Initial journal backfill skipped:', error.message);
     }
 
     // ========================================================
