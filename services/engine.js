@@ -4,7 +4,9 @@ import { User } from '../models/User.js';
 import { normalizeSymbol, isNasdaqSymbol } from './market.js';
 import { analyzeChochSetup, calculateTimeframeDirection } from './structure.js';
 import { evaluateNqBulletStrategy } from './nqBullet.js';
-import { sendSetupConfirmationEmail } from './email.js';
+import { sendSetupConfirmationEmail, sendSetupMilestoneEmail } from './email.js';
+
+const MAX_JOURNAL_ENTRY_DEVIATION_R = 0.25;
 
 export function evaluateConditionMatch(condition, event) {
   const params = condition.parameters || {};
@@ -39,6 +41,65 @@ export function evaluateConditionMatch(condition, event) {
   }
 }
 
+export function getNewChochMilestones(previousProgress = {}, progress = {}) {
+  const milestones = [];
+  const chochTime = Number(progress.chochTime);
+
+  if (Number.isFinite(chochTime) && chochTime > 0 && chochTime !== Number(previousProgress.chochTime)) {
+    milestones.push({
+      key: `CHOCH-${chochTime}`,
+      type: 'CHOCH_DETECTED',
+      stage: 'CHOCH',
+      price: progress.chochPrice,
+      occurredAt: new Date(chochTime),
+      message: `${progress.direction} 15M CHOCH body closed at ${progress.chochPrice} beyond swing level ${progress.swingLevel}.`,
+    });
+  }
+
+  const candle1 = progress.candle1;
+  const candle1Time = Number(candle1?.closeTime);
+  if (
+    candle1?.held &&
+    candle1?.isDirectional &&
+    Number.isFinite(candle1Time) &&
+    candle1Time > 0 &&
+    candle1Time !== Number(previousProgress.candle1?.closeTime)
+  ) {
+    milestones.push({
+      key: `CANDLE_1-${candle1Time}`,
+      type: 'CONFIRMATION_STEP',
+      stage: 'CANDLE_1',
+      price: candle1.close,
+      occurredAt: new Date(candle1Time),
+      message: `${progress.direction} 15M confirmation candle #1 completed at ${candle1.close} and held the CHOCH structure.`,
+    });
+  }
+
+  return milestones;
+}
+
+export function isNewOpposingChoch(setup, previousProgress = {}, opposingProgress = {}) {
+  const previousChochTime = Number(previousProgress.chochTime);
+  const hasPreviousChoch = Number.isFinite(previousChochTime) && previousChochTime > 0;
+  const baselineDirection = hasPreviousChoch
+    ? previousProgress.direction
+    : setup.direction;
+  if (!['BUY', 'SELL'].includes(baselineDirection)) return false;
+
+  const startedAt = setup.strategyStartedAt || setup.createdAt;
+  const referenceTime = hasPreviousChoch
+    ? previousChochTime
+    : startedAt
+      ? new Date(startedAt).getTime()
+      : 0;
+  const opposingDirection = baselineDirection === 'BUY' ? 'SELL' : 'BUY';
+
+  return (
+    opposingProgress.direction === opposingDirection &&
+    Number(opposingProgress.chochTime) > referenceTime
+  );
+}
+
 async function triggerConfirmationEmail(setup, eventRecord, targets) {
   try {
     const userRecord = await User.findById(setup.userId);
@@ -58,21 +119,63 @@ async function triggerConfirmationEmail(setup, eventRecord, targets) {
   }
 }
 
+async function triggerMilestoneEmail(setup, eventRecord) {
+  try {
+    const userRecord = await User.findById(setup.userId);
+    if (!userRecord || userRecord.emailNotifications === false) return;
+
+    sendSetupMilestoneEmail({
+      to: userRecord.alertEmail || userRecord.email,
+      setup: typeof setup.toObject === 'function' ? setup.toObject() : setup,
+      event: typeof eventRecord?.toObject === 'function' ? eventRecord.toObject() : eventRecord,
+      userConfig: userRecord.emailConfig || {},
+    }).catch((emailErr) => {
+      console.warn('Milestone email dispatch warning:', emailErr.message);
+    });
+  } catch (err) {
+    console.warn('triggerMilestoneEmail error:', err.message);
+  }
+}
+
+async function saveNewAgentEvent(eventData) {
+  const eventRecord = new AgentEvent(eventData);
+  try {
+    await eventRecord.save();
+    return eventRecord;
+  } catch (err) {
+    if (err?.code === 11000) return null;
+    throw err;
+  }
+}
+
 export function buildJournalTradePlan(setup, currentPrice) {
   const progress = setup.strategyProgress || {};
   const direction = progress.direction || setup.direction;
   const stopLoss = Number(progress.targets?.stopLoss);
-  const entryCandidates = [
-    currentPrice,
+  const setupEntryPrice = [
     progress.candle2?.close,
+    progress.targets?.entryPrice,
     progress.chochPrice,
     progress.swingLevel,
-  ];
-  const entryPrice = entryCandidates
+  ]
     .map(Number)
     .find((price) => Number.isFinite(price) && price > 0);
-  const validLevels =
+  const hasValidSetupLevels =
     Number.isFinite(stopLoss) &&
+    Number.isFinite(setupEntryPrice) &&
+    ((direction === 'BUY' && stopLoss < setupEntryPrice) ||
+      (direction === 'SELL' && stopLoss > setupEntryPrice));
+  const setupRisk = hasValidSetupLevels ? Math.abs(setupEntryPrice - stopLoss) : null;
+  const livePrice = Number(currentPrice);
+  const hasLivePrice = Number.isFinite(livePrice) && livePrice > 0;
+  const priceMovedTooFar =
+    hasValidSetupLevels &&
+    hasLivePrice &&
+    Math.abs(livePrice - setupEntryPrice) > setupRisk * MAX_JOURNAL_ENTRY_DEVIATION_R;
+  const entryPrice = hasValidSetupLevels && !priceMovedTooFar
+    ? (hasLivePrice ? livePrice : setupEntryPrice)
+    : undefined;
+  const validLevels =
     Number.isFinite(entryPrice) &&
     ((direction === 'BUY' && stopLoss < entryPrice) ||
       (direction === 'SELL' && stopLoss > entryPrice));
@@ -87,6 +190,11 @@ export function buildJournalTradePlan(setup, currentPrice) {
       ? entryPrice + (direction === 'BUY' ? 1 : -1) * risk * 3
       : undefined,
     tradeRiskReward: '1:3',
+    tradeEntryStatus: priceMovedTooFar
+      ? 'SKIPPED_PRICE_MOVED'
+      : validLevels
+        ? 'READY'
+        : 'SKIPPED_INVALID_SETUP',
     journalOutcome: 'OPEN',
     journalLastPrice: validLevels ? entryPrice : undefined,
   };
@@ -148,6 +256,7 @@ export class StrategyEngine {
     this.journalSubscriptions = new Set();
     this.journalBackfillSymbols = new Set();
     this.journalBackfillComplete = false;
+    this.journalStartAt = null;
 
     if (provider && typeof provider.onTick === 'function') {
       provider.onTick((tick) => {
@@ -198,12 +307,18 @@ export class StrategyEngine {
   }
 
   async settleJournalTrades(symbol, marketData) {
-    if (!this.provider || !this.journalBackfillComplete || this.journalBackfillSymbols.has(symbol)) return;
+    if (
+      !this.provider ||
+      !this.journalStartAt ||
+      !this.journalBackfillComplete ||
+      this.journalBackfillSymbols.has(symbol)
+    ) return;
 
     try {
       const entries = await AgentEvent.find({
         symbol: normalizeSymbol(symbol),
         type: 'STRATEGY_CONFIRMED',
+        createdAt: { $gte: this.journalStartAt },
         journalOutcome: 'OPEN',
         tradeEntryPrice: { $type: 'number' },
         tradeStopLoss: { $type: 'number' },
@@ -253,6 +368,7 @@ export class StrategyEngine {
   }
 
   async backfillJournalTrades(userId, legacyEntries = []) {
+    if (!this.journalStartAt) return;
     const userFilter = userId ? { userId } : {};
     const entriesByEventId = new Map();
     const entriesBySetupId = new Map();
@@ -269,6 +385,7 @@ export class StrategyEngine {
     const oldEvents = await AgentEvent.find({
       ...userFilter,
       type: 'STRATEGY_CONFIRMED',
+      createdAt: { $gte: this.journalStartAt },
       journalResultSource: { $ne: 'AUTO' },
     }).sort({ createdAt: 1 });
 
@@ -345,28 +462,41 @@ export class StrategyEngine {
           (direction === 'SELL' && stopLoss > entryPrice));
       if (!validLevels) continue;
 
-      const risk = Math.abs(entryPrice - stopLoss);
+      const journalPlan = buildJournalTradePlan(
+        {
+          ...setup,
+          direction,
+          strategyProgress: {
+            ...progress,
+            direction,
+            targets: { ...progress.targets, stopLoss },
+          },
+        },
+        entryPrice
+      );
+      if (!Number.isFinite(journalPlan.tradeEntryPrice)) continue;
+
       event.setupName = event.setupName || legacyEntry?.name || setup?.name || `${event.symbol} setup`;
       event.timeframe = event.timeframe || legacyEntry?.timeframe || setup?.primaryTimeframe || '15M';
       event.direction = direction;
-      event.tradeEntryPrice = event.tradeEntryPrice ?? entryPrice;
-      event.tradeStopLoss = event.tradeStopLoss ?? stopLoss;
-      event.tradeTakeProfit =
-        event.tradeTakeProfit ??
-        entryPrice + (direction === 'BUY' ? 1 : -1) * risk * 3;
-      event.tradeRiskReward = event.tradeRiskReward || '1:3';
+      event.tradeEntryPrice = journalPlan.tradeEntryPrice;
+      event.tradeStopLoss = journalPlan.tradeStopLoss;
+      event.tradeTakeProfit = journalPlan.tradeTakeProfit;
+      event.tradeRiskReward = journalPlan.tradeRiskReward;
+      event.tradeEntryStatus = journalPlan.tradeEntryStatus;
       event.journalOutcome = 'OPEN';
       event.journalResultR = undefined;
       event.tradeExitPrice = undefined;
       event.journalClosedAt = undefined;
       event.journalResultSource = undefined;
-      event.journalLastPrice = event.journalLastPrice ?? entryPrice;
+      event.journalLastPrice = event.journalLastPrice ?? journalPlan.tradeEntryPrice;
       await event.save();
     }
 
     const openEvents = await AgentEvent.find({
       ...userFilter,
       type: 'STRATEGY_CONFIRMED',
+      createdAt: { $gte: this.journalStartAt },
       journalOutcome: 'OPEN',
       tradeEntryPrice: { $type: 'number' },
       tradeStopLoss: { $type: 'number' },
@@ -571,13 +701,20 @@ export class StrategyEngine {
 
       await record.save();
 
+      if (strategyCondition) {
+        await this.publishChochMilestones(
+          record,
+          getNewChochMilestones({}, record.strategyProgress || {})
+        );
+      }
+
       let eventRecord = null;
       if (record.status === 'CONFIRMED' && strategyCondition) {
         const currentPrice = this.provider.getSnapshot(record.symbol)?.price;
-        eventRecord = new AgentEvent({
+        eventRecord = await saveNewAgentEvent({
           userId: record.userId,
           setupId: record._id,
-          eventId: `STRATEGY_CONFIRMED-${Date.now()}-${record._id}`,
+          eventId: `STRATEGY_CONFIRMED-${record.strategyProgress.chochTime}-${record._id}`,
           type: 'STRATEGY_CONFIRMED',
           symbol: record.symbol,
           message: strategyCondition.message,
@@ -585,8 +722,9 @@ export class StrategyEngine {
           direction: record.strategyProgress.direction,
           ...buildJournalTradePlan(record, currentPrice),
         });
-        await eventRecord.save();
-        triggerConfirmationEmail(record, eventRecord, record.strategyProgress?.targets);
+        if (eventRecord) {
+          triggerConfirmationEmail(record, eventRecord, record.strategyProgress?.targets);
+        }
       }
 
       this.bus.emit('update', {
@@ -598,6 +736,34 @@ export class StrategyEngine {
       });
     } catch (err) {
       console.warn(`StrategyEngine start error for ${setup.symbol}:`, err.message);
+    }
+  }
+
+  async publishChochMilestones(setup, milestones) {
+    for (const milestone of milestones) {
+      const eventRecord = await saveNewAgentEvent({
+        userId: setup.userId,
+        setupId: setup._id,
+        eventId: `${milestone.key}-${setup._id}`,
+        type: milestone.type,
+        stage: milestone.stage,
+        symbol: setup.symbol,
+        timeframe: '15M',
+        message: milestone.message,
+        price: milestone.price,
+        direction: setup.strategyProgress?.direction,
+        occurredAt: milestone.occurredAt,
+      });
+      if (!eventRecord) continue;
+
+      await triggerMilestoneEmail(setup, eventRecord);
+      this.bus.emit('update', {
+        type: 'setup:update',
+        setupId: setup._id.toString(),
+        userId: setup.userId.toString(),
+        setup: setup.toObject(),
+        event: eventRecord.toObject(),
+      });
     }
   }
 
@@ -847,7 +1013,7 @@ export class StrategyEngine {
   async processChochSetups(symbol, candles, frameHistory) {
     const setups = await Setup.find({
       symbol,
-      status: { $in: ['MONITORING', 'PARTIALLY_CONFIRMED'] },
+      status: { $in: ['MONITORING', 'PARTIALLY_CONFIRMED', 'CONFIRMED'] },
       'conditions.type': 'CHOCH_2C_CONFIRMATION',
     });
     const oneHourDir = calculateTimeframeDirection(frameHistory.get('1H'));
@@ -855,12 +1021,57 @@ export class StrategyEngine {
 
     for (const setup of setups) {
       const condition = setup.conditions.find((item) => item.type === 'CHOCH_2C_CONFIRMATION');
-      if (!condition || condition.status === 'TRIGGERED') continue;
+      if (!condition) continue;
+
+      const previousProgress = setup.strategyProgress || {};
+      const previousChochTime = Number(previousProgress.chochTime);
+      const hasPreviousChoch = Number.isFinite(previousChochTime) && previousChochTime > 0;
+      const baselineDirection = hasPreviousChoch ? previousProgress.direction : setup.direction;
+      if (['BUY', 'SELL'].includes(baselineDirection)) {
+        const referenceTime = hasPreviousChoch
+          ? previousChochTime
+          : setup.strategyStartedAt
+            ? new Date(setup.strategyStartedAt).getTime()
+            : 0;
+        const oppositeDirection = baselineDirection === 'BUY' ? 'SELL' : 'BUY';
+        const opposingProgress = analyzeChochSetup(candles, oppositeDirection, {
+          ...condition.parameters,
+          activeAfter: referenceTime,
+        });
+
+        if (isNewOpposingChoch(setup, previousProgress, opposingProgress)) {
+          const reversalTime = Number(opposingProgress.chochTime);
+          const reversalEvent = await saveNewAgentEvent({
+            userId: setup.userId,
+            setupId: setup._id,
+            eventId: `OPPOSING_CHOCH-${reversalTime}-${setup._id}`,
+            type: 'OPPOSING_CHOCH',
+            stage: 'OPPOSING_CHOCH',
+            symbol: setup.symbol,
+            timeframe: '15M',
+            message: `Opposing 15M CHOCH observed against the ${baselineDirection} setup direction at ${opposingProgress.chochPrice}. Informational only; this does not confirm or invalidate the setup.`,
+            price: opposingProgress.chochPrice,
+            direction: opposingProgress.direction,
+            occurredAt: new Date(reversalTime),
+          });
+          if (reversalEvent) {
+            this.bus.emit('update', {
+              type: 'setup:reversal',
+              setupId: setup._id.toString(),
+              userId: setup.userId.toString(),
+              event: reversalEvent.toObject(),
+            });
+          }
+        }
+      }
+
+      if (condition.status === 'TRIGGERED') continue;
 
       const progress = analyzeChochSetup(candles, setup.direction, {
         ...condition.parameters,
         activeAfter: setup.strategyStartedAt?.getTime(),
       });
+      const milestones = getNewChochMilestones(previousProgress, progress);
       progress.timeframeBias = { '1H': oneHourDir, '4H': fourHourDir };
       setup.strategyProgress = progress;
 
@@ -871,8 +1082,9 @@ export class StrategyEngine {
         condition.message = `${progress.direction} CHOCH confirmed: body closed beyond ${progress.direction === 'SELL' ? 'HL' : 'LH'} at $${progress.swingLevel}; ${progress.confirmationCandles} completed 15M candles followed. Setup Area: $${progress.setupArea?.bottom} - $${progress.setupArea?.top}. HTF: 1H ${oneHourDir.direction}, 4H ${fourHourDir.direction}.`;
         setup.status = 'CONFIRMED';
         await setup.save();
+        await this.publishChochMilestones(setup, milestones);
 
-        const eventRecord = new AgentEvent({
+        const eventRecord = await saveNewAgentEvent({
           userId: setup.userId,
           setupId: setup._id,
           eventId: `STRATEGY_CONFIRMED-${progress.chochTime}-${setup._id}`,
@@ -886,20 +1098,25 @@ export class StrategyEngine {
             this.provider.getSnapshot(setup.symbol)?.price
           ),
         });
-        await eventRecord.save();
-        triggerConfirmationEmail(setup, eventRecord, progress.targets);
+        if (eventRecord) {
+          triggerConfirmationEmail(setup, eventRecord, progress.targets);
+        }
 
-        this.bus.emit('update', {
-          type: 'setup:update',
-          setupId: setup._id.toString(),
-          userId: setup.userId.toString(),
-          setup: setup.toObject(),
-          event: eventRecord.toObject(),
-        });
+        if (eventRecord) {
+          this.bus.emit('update', {
+            type: 'setup:update',
+            setupId: setup._id.toString(),
+            userId: setup.userId.toString(),
+            setup: setup.toObject(),
+            event: eventRecord.toObject(),
+          });
+        }
         continue;
       }
 
       await setup.save();
+      await this.publishChochMilestones(setup, milestones);
+
       this.bus.emit('update', {
         type: 'setup:progress',
         setupId: setup._id.toString(),

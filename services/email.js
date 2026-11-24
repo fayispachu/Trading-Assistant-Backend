@@ -213,6 +213,49 @@ export async function sendSetupConfirmationEmail({
   }
 }
 
+export async function sendSetupMilestoneEmail({ to, setup, event, userConfig = {} }) {
+  try {
+    const transporter = await getTransporter(userConfig);
+    if (!transporter) {
+      return { success: false, error: 'Email service is not configured.' };
+    }
+
+    const recipient = to || userConfig.alertEmail || process.env.ALERT_EMAIL;
+    if (!recipient) {
+      return { success: false, error: 'No recipient email specified.' };
+    }
+
+    const symbol = setup?.symbol || 'Market';
+    const stageLabel = event?.stage === 'CHOCH'
+      ? '15-minute CHOCH detected'
+      : 'First confirmation candle completed';
+    const fromAddress = userConfig.fromEmail || userConfig.smtpUser || process.env.SMTP_USER || '"Trader Assist" <alerts@traderassist.internal>';
+    const info = await transporter.sendMail({
+      from: fromAddress,
+      to: recipient,
+      subject: `Trader Assist update: ${stageLabel} on ${symbol}`,
+      text: [
+        `Setup: ${setup?.name || symbol}`,
+        `Symbol: ${symbol}`,
+        `Direction: ${event?.direction || setup?.direction || 'BOTH'}`,
+        `Timeframe: ${event?.timeframe || '15M'}`,
+        `Update: ${event?.message || stageLabel}`,
+        'This is a setup progress update, not an instruction to trade.',
+      ].join('\n'),
+    });
+
+    return {
+      success: true,
+      messageId: info.messageId,
+      previewUrl: etherealAccount && info.messageId ? nodemailer.getTestMessageUrl(info) : null,
+      recipient,
+    };
+  } catch (err) {
+    console.error('Failed to send setup milestone email:', err);
+    return { success: false, error: err.message };
+  }
+}
+
 /**
  * Send a Test Email to verify user configuration
  */
@@ -237,7 +280,7 @@ export async function sendTestEmail({ to, userConfig = {} }) {
       html: `
         <div style="font-family: sans-serif; background: #0f172a; color: #f8fafc; padding: 24px; border-radius: 8px; max-width: 500px;">
           <h2 style="color: #10b981; margin-top: 0;">✓ Email Notifications Active!</h2>
-          <p style="color: #cbd5e1; font-size: 14px;">Your free email setup is working perfectly. You will receive immediate trade alerts whenever all confirmation conditions are strictly met on your NASDAQ CFD or XRP setups.</p>
+          <p style="color: #cbd5e1; font-size: 14px;">Your email setup is working. You will receive setup emails when a 15M CHOCH, a confirmation candle, or full confirmation is recorded. Opposing CHOCH observations are listed in the app only.</p>
           <div style="background: #1e293b; padding: 12px; border-radius: 6px; font-size: 13px; color: #94a3b8;">
             <div><strong>Recipient:</strong> ${recipient}</div>
             <div><strong>Timestamp:</strong> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST</div>

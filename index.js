@@ -8,6 +8,7 @@ import { Server } from 'socket.io';
 
 import { connectDB } from './config/db.js';
 import { Setup } from './models/index.js';
+import { getJournalStartAt } from './models/JournalState.js';
 import {
   DeltaIndiaProvider,
   normalizeSymbol,
@@ -51,6 +52,8 @@ const secret =
   'development-only-change-me';
 
 const port = Number(process.env.PORT || 3001);
+const host = process.env.HOST ||
+  (process.env.NODE_ENV === 'production' || process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
 
 // ============================================================
 // CORS CONFIGURATION
@@ -307,6 +310,13 @@ engine.onUpdate((payload) => {
       return;
     }
 
+    if (payload.type === 'setup:reversal') {
+      io
+        .to(`user:${payload.userId}`)
+        .emit('setup:reversal', payload.event);
+      return;
+    }
+
     // Setup update
     io
       .to(
@@ -354,6 +364,7 @@ async function startServer() {
   try {
     // Connect MongoDB
     await connectDB();
+    engine.journalStartAt = await getJournalStartAt();
 
     // ========================================================
     // LOAD EXISTING ACTIVE SETUPS
@@ -464,6 +475,7 @@ async function startServer() {
 
     server.listen(
       port,
+      host,
       () => {
         console.log(
           `Trader Assist Backend listening on http://localhost:${port}`

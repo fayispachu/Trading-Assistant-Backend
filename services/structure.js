@@ -265,12 +265,22 @@ export function analyzeChochSetup(candles, direction = 'BOTH', options = {}) {
 
   function evaluateCandidate(struct) {
     if (!struct) return null;
-    const breakIdx = bars.findIndex((candle, index) => {
-      if (index <= struct.level.index || Number(candle.closeTime) <= activeAfter) return false;
-      return struct.direction === 'SELL'
-        ? candle.close < struct.level.price
-        : candle.close > struct.level.price;
-    });
+    let breakIdx = -1;
+    for (let index = struct.level.index + 1; index < bars.length; index += 1) {
+      const candle = bars[index];
+      const previousClose = Number(bars[index - 1]?.close);
+      const crossedLevel = struct.direction === 'SELL'
+        ? candle.close < struct.level.price && previousClose >= struct.level.price
+        : candle.close > struct.level.price && previousClose <= struct.level.price;
+      if (crossedLevel) breakIdx = index;
+    }
+
+    if (breakIdx >= 0 && activeAfter > 0) {
+      const chochIsCurrent =
+        Number(bars[breakIdx].closeTime) > activeAfter ||
+        bars.slice(breakIdx + 1).some((candle) => Number(candle.closeTime) > activeAfter);
+      if (!chochIsCurrent) breakIdx = -1;
+    }
     return { struct, breakIndex: breakIdx };
   }
 
@@ -413,6 +423,7 @@ export function analyzeChochSetup(candles, direction = 'BOTH', options = {}) {
   for (let i = 0; i < postChochCandles.length - 1; i += 1) {
     const c1 = postChochCandles[i];
     const c2 = postChochCandles[i + 1];
+    if (activeAfter > 0 && Number(c2.closeTime) <= activeAfter) continue;
     const prevC = i === 0 ? chochCandle : postChochCandles[i - 1];
     const dir1 = getCandleDirection(c1, prevC);
     const dir2 = getCandleDirection(c2, c1);
@@ -463,12 +474,18 @@ export function analyzeChochSetup(candles, direction = 'BOTH', options = {}) {
       candleType: confirmedPair.dir2,
     };
   } else {
-    if (postChochCandles.length >= 1) {
-      const c1 = postChochCandles[0];
-      const dir1 = getCandleDirection(c1, chochCandle);
+    const fallbackPairStartIndex = activeAfter > 0
+      ? Math.max(0, postChochCandles.length - 2)
+      : 0;
+    if (postChochCandles.length > fallbackPairStartIndex) {
+      const c1 = postChochCandles[fallbackPairStartIndex];
+      const previousCandle = fallbackPairStartIndex > 0
+        ? postChochCandles[fallbackPairStartIndex - 1]
+        : chochCandle;
+      const dir1 = getCandleDirection(c1, previousCandle);
       const held1 = reqDir === 'SELL' ? c1.close <= structure.level.price : c1.close >= structure.level.price;
       const isDir1 = dir1 === reqDir || (dir1 === 'NEUTRAL' && held1);
-      const open1 = c1.open !== undefined ? c1.open : chochCandle.close;
+      const open1 = c1.open !== undefined ? c1.open : previousCandle.close;
 
       candle1 = {
         open: open1,
@@ -482,12 +499,13 @@ export function analyzeChochSetup(candles, direction = 'BOTH', options = {}) {
       };
     }
 
-    if (postChochCandles.length >= 2) {
-      const c2 = postChochCandles[1];
-      const dir2 = getCandleDirection(c2, postChochCandles[0]);
+    if (postChochCandles.length > fallbackPairStartIndex + 1) {
+      const c2 = postChochCandles[fallbackPairStartIndex + 1];
+      const previousCandle = postChochCandles[fallbackPairStartIndex];
+      const dir2 = getCandleDirection(c2, previousCandle);
       const held2 = reqDir === 'SELL' ? c2.close <= structure.level.price : c2.close >= structure.level.price;
       const isDir2 = dir2 === reqDir || (dir2 === 'NEUTRAL' && held2);
-      const open2 = c2.open !== undefined ? c2.open : postChochCandles[0].close;
+      const open2 = c2.open !== undefined ? c2.open : previousCandle.close;
 
       candle2 = {
         open: open2,

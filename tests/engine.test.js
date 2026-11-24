@@ -3,6 +3,8 @@ import {
   buildJournalTradePlan,
   evaluateConditionMatch,
   evaluateJournalTrade,
+  getNewChochMilestones,
+  isNewOpposingChoch,
   StrategyEngine,
 } from '../engine.js';
 import { analyzeChochSetup, calculateTimeframeDirection, findSwingPivots } from '../services/structure.js';
@@ -62,6 +64,49 @@ describe('condition mappings', () => {
   });
 });
 
+describe('CHOCH notification milestones', () => {
+  it('creates one event for a new CHOCH and each valid confirmation candle', () => {
+    const progress = {
+      direction: 'SELL',
+      chochTime: 1000,
+      chochPrice: 9.5,
+      swingLevel: 10,
+      candle1: {
+        closeTime: 2000,
+        close: 9,
+        held: true,
+        isDirectional: true,
+      },
+    };
+
+    expect(getNewChochMilestones({}, progress).map(({ type, stage }) => [type, stage])).toEqual([
+      ['CHOCH_DETECTED', 'CHOCH'],
+      ['CONFIRMATION_STEP', 'CANDLE_1'],
+    ]);
+    expect(getNewChochMilestones(progress, progress)).toEqual([]);
+    expect(getNewChochMilestones({}, {
+      ...progress,
+      candle1: { ...progress.candle1, held: false },
+    })).toHaveLength(1);
+  });
+
+  it('records an opposite CHOCH only after the monitored direction has been established', () => {
+    const setup = { direction: 'BUY', strategyStartedAt: new Date(1000) };
+    expect(isNewOpposingChoch(setup, {}, { direction: 'SELL', chochTime: 2000 })).toBe(true);
+    expect(isNewOpposingChoch(setup, {}, { direction: 'SELL', chochTime: 1000 })).toBe(false);
+    expect(isNewOpposingChoch(
+      { direction: 'BOTH', strategyStartedAt: new Date(1000) },
+      {},
+      { direction: 'SELL', chochTime: 2000 }
+    )).toBe(false);
+    expect(isNewOpposingChoch(
+      setup,
+      { direction: 'SELL', chochTime: 1500 },
+      { direction: 'BUY', chochTime: 2000 }
+    )).toBe(true);
+  });
+});
+
 describe('automated journal trade levels and outcomes', () => {
   it('builds a 1:3 short target from the setup swing stop', () => {
     const plan = buildJournalTradePlan(
@@ -71,6 +116,7 @@ describe('automated journal trade levels and outcomes', () => {
         primaryTimeframe: '15M',
         strategyProgress: {
           direction: 'SELL',
+          candle2: { close: 100 },
           targets: { stopLoss: 110 },
         },
       },
@@ -83,6 +129,41 @@ describe('automated journal trade levels and outcomes', () => {
       tradeTakeProfit: 70,
       tradeRiskReward: '1:3',
       journalOutcome: 'OPEN',
+      tradeEntryStatus: 'READY',
+    });
+  });
+
+  it('uses the setup entry and swing stop, and rejects a live price more than 0.25R away', () => {
+    const setup = {
+      direction: 'BUY',
+      strategyProgress: {
+        direction: 'BUY',
+        candle2: { close: 100 },
+        targets: { stopLoss: 90 },
+      },
+    };
+
+    expect(buildJournalTradePlan(setup, 102.5)).toMatchObject({
+      tradeEntryPrice: 102.5,
+      tradeStopLoss: 90,
+      tradeEntryStatus: 'READY',
+    });
+
+    expect(buildJournalTradePlan(setup, 102.51)).toMatchObject({
+      tradeEntryPrice: undefined,
+      tradeStopLoss: 90,
+      tradeTakeProfit: undefined,
+      tradeEntryStatus: 'SKIPPED_PRICE_MOVED',
+    });
+  });
+
+  it('does not create a trade entry when the setup has no usable swing levels', () => {
+    expect(buildJournalTradePlan({
+      direction: 'BUY',
+      strategyProgress: { direction: 'BUY', targets: { stopLoss: 90 } },
+    }, 100)).toMatchObject({
+      tradeEntryPrice: undefined,
+      tradeEntryStatus: 'SKIPPED_INVALID_SETUP',
     });
   });
 
@@ -241,6 +322,34 @@ describe('15M CHOCH strategy', () => {
       activeAfter: 12000000,
     });
     expect(breakBeforeMonitoring.phase).toBe('WAITING_FOR_CHOCH');
+  });
+
+  it('carries a prior directional CHOCH into confirmations completed after monitoring starts', () => {
+    const result = analyzeChochSetup(makeCandles(sellValues), 'SELL', {
+    pivotStrength: 1,
+    activeAfter: 10000000,
+    });
+
+    expect(result.phase).toBe('CONFIRMED');
+    expect(result.direction).toBe('SELL');
+    expect(result.chochTime).toBe(9900000);
+    expect(result.candle2.closeTime).toBeGreaterThan(10000000);
+  });
+
+  it('uses a fresh CHOCH after an earlier break was invalidated', () => {
+    const values = [
+    ...sellValues.slice(0, 10),
+    [17, 7, 7.5],
+    [14, 12, 13],
+    [13, 6.8, 7.0],
+    [7.0, 6.2, 6.5],
+    [6.5, 5.8, 6.0],
+    ];
+    const result = analyzeChochSetup(makeCandles(values), 'SELL', { pivotStrength: 1 });
+
+    expect(result.phase).toBe('CONFIRMED');
+    expect(result.chochTime).toBe(13 * 900000);
+    expect(result.direction).toBe('SELL');
   });
 
   it('rejects confirmation if post-CHOCH candle is a buy/bullish candle instead of continuous sell', () => {
